@@ -1,0 +1,77 @@
+diff --git a/src/com/android/settings/accessibility/setupwizard/DisplaySizeSliderItemController.kt b/src/com/android/settings/accessibility/setupwizard/DisplaySizeSliderItemController.kt
+index 0cd2d0c..05d4f09 100644
+--- a/src/com/android/settings/accessibility/setupwizard/DisplaySizeSliderItemController.kt
++++ b/src/com/android/settings/accessibility/setupwizard/DisplaySizeSliderItemController.kt
+@@ -39,6 +39,10 @@ internal class DisplaySizeSliderItemController(
+                     min = minValue
+                     max = maxValue
+                     sliderIncrement = getIncrementStep(context)
++                    // SoftOS: show the current value and persist user changes (was never wired up).
++                    val store = storage(context)
++                    store.getInt(DisplaySizePreference.KEY)?.let { sliderValue = it }
++                    onUserValueChange = { store.setInt(DisplaySizePreference.KEY, it) }
+                     isVisible = true
+                 } else {
+                     // Determine visibility based on range availability.
+diff --git a/src/com/android/settings/accessibility/setupwizard/FontSizeSliderItemController.kt b/src/com/android/settings/accessibility/setupwizard/FontSizeSliderItemController.kt
+index 7a713b8..34d33dc 100644
+--- a/src/com/android/settings/accessibility/setupwizard/FontSizeSliderItemController.kt
++++ b/src/com/android/settings/accessibility/setupwizard/FontSizeSliderItemController.kt
+@@ -36,6 +36,10 @@ internal class FontSizeSliderItemController(
+                 min = getMinValue(context)
+                 max = getMaxValue(context)
+                 sliderIncrement = getIncrementStep(context)
++                // SoftOS: show the current value and persist user changes (was never wired up).
++                val store = storage(context)
++                store.getInt(FontSizePreference.KEY)?.let { sliderValue = it }
++                onUserValueChange = { store.setInt(FontSizePreference.KEY, it) }
+             }
+         }
+     }
+diff --git a/src/com/android/settings/accessibility/setupwizard/items/SliderItem.kt b/src/com/android/settings/accessibility/setupwizard/items/SliderItem.kt
+index ee9d4d3..7b6971b 100644
+--- a/src/com/android/settings/accessibility/setupwizard/items/SliderItem.kt
++++ b/src/com/android/settings/accessibility/setupwizard/items/SliderItem.kt
+@@ -120,6 +120,15 @@ class SliderItem : Item {
+             }
+         }
+ 
++    /** SoftOS: called when the user changes the value, so the controller can persist it. */
++    var onUserValueChange: ((Int) -> Unit)? = null
++
++    private fun setValueFromUser(value: Int) {
++        val old = sliderValue
++        sliderValue = value
++        if (sliderValue != old) onUserValueChange?.invoke(sliderValue)
++    }
++
+     private var _sliderIncrement: Int = 0
+     var sliderIncrement: Int
+         get() = _sliderIncrement
+@@ -363,7 +372,7 @@ class SliderItem : Item {
+                 iconFrame.context.getString(iconStartContentDescriptionId)
+         }
+ 
+-        iconFrame.setOnClickListener { if (sliderValue > min) sliderValue -= sliderIncrement }
++        iconFrame.setOnClickListener { if (sliderValue > min) setValueFromUser(sliderValue - sliderIncrement) }
+         iconFrame.visibility = View.VISIBLE
+         setIconViewAndFrameEnabled(iconView, iconFrame, sliderValue > min)
+     }
+@@ -380,7 +389,7 @@ class SliderItem : Item {
+             iconFrame.contentDescription = iconFrame.context.getString(iconEndContentDescriptionId)
+         }
+ 
+-        iconFrame.setOnClickListener { if (sliderValue < max) sliderValue += sliderIncrement }
++        iconFrame.setOnClickListener { if (sliderValue < max) setValueFromUser(sliderValue + sliderIncrement) }
+         iconFrame.visibility = View.VISIBLE
+         setIconViewAndFrameEnabled(iconView, iconFrame, sliderValue < max)
+     }
+@@ -394,7 +403,7 @@ class SliderItem : Item {
+     private fun syncValueInternal(slider: Slider) {
+         val newValue = slider.value.toInt()
+         if (newValue != sliderValue) {
+-            sliderValue = newValue
++            setValueFromUser(newValue)
+             when (hapticFeedbackMode) {
+                 HAPTIC_FEEDBACK_MODE_ON_TICKS -> slider.performHapticFeedback(CLOCK_TICK)
+                 HAPTIC_FEEDBACK_MODE_ON_ENDS -> {

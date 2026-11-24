@@ -1,0 +1,634 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SoftOS <>
+Date: Thu, 19 Nov 2026 12:00:00 +0300
+Subject: [PATCH] SystemUI: VoLTE/VoWiFi durum çubuğu simgesi (gerçek IMS durumu)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+SystemUI: durum çubuğunda HD (VoLTE/VoNR) ve VoWiFi simgesi (SoftOS).
+
+Anahtar/tuner YOK. Simge yalnız telefon servisi doğruladığında görünür
+(abonelik başına, mobil sinyal grubunun içinde):
+- HD: ImsMmTelManager.isAdvancedCallingSettingEnabled() açık VE IMS
+  LTE/NR üzerinden kayıtlı VE MmTel VOICE yeteneği mevcut.
+- VoWiFi: IMS IWLAN üzerinden kayıtlı VE VOICE yeteneği mevcut.
+VoLTE ayarı değişince SubscriptionManager.ADVANCED_CALLING_ENABLED_CONTENT_URI
+gözlemcisi ve IMS kayıt/yetenek geri çağrıları durumu yeniler; IMS servisi
+düşerse (ImsStateCallback.onUnavailable/onError) simge gizlenir.
+
+crDroid/LibreMobileOS ImsRepository'den yalın taşıma:
+- yeni ImsVoiceRepository (bağımsız, @Inject; Dagger modülü değişmez;
+  geri çağrılar tek iş parçacıklı @Background Executor üzerinde sırayla),
+- MobileIconViewModelCommon.imsVoiceIcon (varsayılan NONE; Kairos, uydu ve
+  test sahteleri değişmeden derlenir), MobileIconViewModel gerçek değeri
+  verir (uydu bağlantısında gizli),
+- MobileIconsViewModel deposu enjekte edip her aboneliğe akış geçirir,
+- MobileIconBinder simgeleri gösterir ve sinyal simgesiyle aynı tint'i
+  uygular (koyu/açık durum çubuğu); görünümler findViewById ile alınır,
+- yerleşim: RAT (4G/5G) simgesinden sonra mobile_ims_hd/mobile_ims_vowifi.
+MobileConnectionRepository/Interactor ve Kairos dosyalarına dokunulmaz.
+Simgeler: ic_hd_calling (crDroid), ic_vowifi (LibreMobileOS), Apache-2.0;
+ikon paketi overlay'leri aynı adlarla değiştirebilir. Boyutlar
+softos_ims_dimens.xml, metinler softos_ims_strings.xml (+ values-tr).
+---
+  .../status_bar_mobile_signal_group_inner.xml       |   24 ++
+  .../pipeline/mobile/ui/binder/MobileIconBinder.kt  |   17 +
+  .../mobile/ui/viewmodel/MobileIconViewModel.kt     |   18 +
+  .../mobile/ui/viewmodel/MobileIconsViewModel.kt    |    3 
+  .../ims/data/repository/ImsVoiceRepository.kt      |  267 ++++++++++++++++++++
+  packages/SystemUI/res/drawable/ic_hd_calling.xml   |   29 ++
+  packages/SystemUI/res/drawable/ic_vowifi.xml       |   27 ++
+  packages/SystemUI/res/values/softos_ims_dimens.xml |   22 ++
+  .../SystemUI/res/values/softos_ims_strings.xml     |   22 ++
+  .../SystemUI/res/values-tr/softos_ims_strings.xml  |   20 +
+  10 files changed, 449 insertions(+)
+
+diff --git a/packages/SystemUI/res-keyguard/layout/status_bar_mobile_signal_group_inner.xml b/packages/SystemUI/res-keyguard/layout/status_bar_mobile_signal_group_inner.xml
+index 07ec0563f..d62675136 100644
+--- a/packages/SystemUI/res-keyguard/layout/status_bar_mobile_signal_group_inner.xml
++++ b/packages/SystemUI/res-keyguard/layout/status_bar_mobile_signal_group_inner.xml
+@@ -66,6 +66,30 @@
+                 android:adjustViewBounds="true"
+                 />
+         </FrameLayout>
++        <!-- SoftOS: IMS voice icons. Shown only while IMS is registered with voice capability
++             (HD: VoLTE/VoNR enabled + LTE/NR, VoWiFi: IWLAN). Tinted like the signal icon. -->
++        <ImageView
++            android:id="@+id/mobile_ims_hd"
++            android:layout_width="wrap_content"
++            android:layout_height="@dimen/status_bar_ims_hd_height"
++            android:layout_gravity="center_vertical"
++            android:layout_marginStart="@dimen/status_bar_ims_icon_margin"
++            android:layout_marginEnd="@dimen/status_bar_ims_icon_margin"
++            android:adjustViewBounds="true"
++            android:src="@drawable/ic_hd_calling"
++            android:contentDescription="@string/status_bar_ims_hd_calling"
++            android:visibility="gone" />
++        <ImageView
++            android:id="@+id/mobile_ims_vowifi"
++            android:layout_width="wrap_content"
++            android:layout_height="@dimen/status_bar_ims_vowifi_height"
++            android:layout_gravity="center_vertical"
++            android:layout_marginStart="@dimen/status_bar_ims_icon_margin"
++            android:layout_marginEnd="@dimen/status_bar_ims_icon_margin"
++            android:adjustViewBounds="true"
++            android:src="@drawable/ic_vowifi"
++            android:contentDescription="@string/status_bar_ims_vowifi"
++            android:visibility="gone" />
+         <Space
+             android:id="@+id/mobile_roaming_space"
+             android:layout_height="match_parent"
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/binder/MobileIconBinder.kt b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/binder/MobileIconBinder.kt
+index 3904cebea..d0abf6c48 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/binder/MobileIconBinder.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/binder/MobileIconBinder.kt
+@@ -38,6 +38,7 @@ import com.android.systemui.res.R
+ import com.android.systemui.statusbar.StatusBarIconView
+ import com.android.systemui.statusbar.StatusBarIconView.STATE_HIDDEN
+ import com.android.systemui.statusbar.core.NewStatusBarIcons
++import com.android.systemui.statusbar.pipeline.ims.data.repository.ImsVoiceIcon
+ import com.android.systemui.statusbar.pipeline.mobile.domain.model.SignalIconModel
+ import com.android.systemui.statusbar.pipeline.mobile.ui.MobileViewLogger
+ import com.android.systemui.statusbar.pipeline.mobile.ui.viewmodel.LocationBasedMobileViewModel
+@@ -70,6 +71,9 @@ object MobileIconBinder {
+         val roamingView = view.requireViewById<ImageView>(R.id.mobile_roaming)
+         val roamingSpace = view.requireViewById<Space>(R.id.mobile_roaming_space)
+         val endSideRoamingView = view.requireViewById<ImageView>(R.id.mobile_roaming_updated)
++        // SoftOS: IMS voice icons (nullable: a layout without them must not crash)
++        val imsHdView: ImageView? = view.findViewById(R.id.mobile_ims_hd)
++        val imsVoWifiView: ImageView? = view.findViewById(R.id.mobile_ims_vowifi)
+         val dotView = view.requireViewById<StatusBarIconView>(R.id.status_bar_dot)
+ 
+         view.isVisible = viewModel.isVisible.value
+@@ -236,6 +240,17 @@ object MobileIconBinder {
+                         }
+                     }
+ 
++                    // SoftOS: HD (VoLTE/VoNR) or VoWiFi icon, only while IMS really carries voice.
++                    // Read from commonImpl so it does not depend on interface delegation of
++                    // default members.
++                    launch {
++                        viewModel.commonImpl.imsVoiceIcon.distinctUntilChanged().collect { ims ->
++                            imsHdView?.isVisible = ims == ImsVoiceIcon.HD
++                            imsVoWifiView?.isVisible = ims == ImsVoiceIcon.VOWIFI
++                            view.requestLayout()
++                        }
++                    }
++
+                     // Set the activity indicators
+                     launch { viewModel.activityInVisible.collect { activityIn.isVisible = it } }
+ 
+@@ -265,6 +280,8 @@ object MobileIconBinder {
+ 
+                             roamingView.imageTintList = tint
+                             endSideRoamingView.imageTintList = tint
++                            imsHdView?.imageTintList = tint
++                            imsVoWifiView?.imageTintList = tint
+                             activityIn.imageTintList = tint
+                             activityOut.imageTintList = tint
+                             dotView.setDecorColor(colors.tint)
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/viewmodel/MobileIconViewModel.kt b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/viewmodel/MobileIconViewModel.kt
+index 566e2182c..cada8586d 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/viewmodel/MobileIconViewModel.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/viewmodel/MobileIconViewModel.kt
+@@ -23,6 +23,7 @@ import com.android.systemui.log.table.logDiffsForTable
+ import com.android.systemui.res.R
+ import com.android.systemui.statusbar.core.NewStatusBarIcons
+ import com.android.systemui.statusbar.pipeline.airplane.domain.interactor.AirplaneModeInteractor
++import com.android.systemui.statusbar.pipeline.ims.data.repository.ImsVoiceIcon
+ import com.android.systemui.statusbar.pipeline.mobile.NewSatelliteIcon
+ import com.android.systemui.statusbar.pipeline.mobile.domain.interactor.MobileIconInteractor
+ import com.android.systemui.statusbar.pipeline.mobile.domain.interactor.MobileIconsInteractor
+@@ -59,6 +60,13 @@ interface MobileIconViewModelCommon {
+     val activityInVisible: Flow<Boolean>
+     val activityOutVisible: Flow<Boolean>
+     val activityContainerVisible: Flow<Boolean>
++
++    /**
++     * SoftOS: IMS voice icon (HD = VoLTE/VoNR, VoWiFi). Only [MobileIconViewModel] provides a real
++     * value; other implementations keep this default.
++     */
++    val imsVoiceIcon: Flow<ImsVoiceIcon>
++        get() = flowOf(ImsVoiceIcon.NONE)
+ }
+ 
+ /**
+@@ -80,6 +88,7 @@ class MobileIconViewModel(
+     airplaneModeInteractor: AirplaneModeInteractor,
+     constants: ConnectivityConstants,
+     scope: CoroutineScope,
++    imsVoiceIconSource: Flow<ImsVoiceIcon> = flowOf(ImsVoiceIcon.NONE),
+ ) : MobileIconViewModelCommon {
+     private val cellProvider by lazy {
+         CellularIconViewModel(
+@@ -143,6 +152,15 @@ class MobileIconViewModel(
+ 
+     override val activityContainerVisible: Flow<Boolean> =
+         vmProvider.flatMapLatest { it.activityContainerVisible }
++
++    /** SoftOS: hidden on non-terrestrial (satellite) connections. */
++    override val imsVoiceIcon: StateFlow<ImsVoiceIcon> =
++        iconInteractor.isNonTerrestrial
++            .flatMapLatest { nonTerrestrial ->
++                if (nonTerrestrial) flowOf(ImsVoiceIcon.NONE) else imsVoiceIconSource
++            }
++            .distinctUntilChanged()
++            .stateIn(scope, SharingStarted.WhileSubscribed(), ImsVoiceIcon.NONE)
+ }
+ 
+ /** Representation of this network when it is non-terrestrial (e.g., satellite) */
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/viewmodel/MobileIconsViewModel.kt b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/viewmodel/MobileIconsViewModel.kt
+index 3f0fb2965..afff512aa 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/viewmodel/MobileIconsViewModel.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/mobile/ui/viewmodel/MobileIconsViewModel.kt
+@@ -26,6 +26,7 @@ import com.android.systemui.log.table.logDiffsForTable
+ import com.android.systemui.statusbar.phone.StatusBarLocation
+ import com.android.systemui.statusbar.pipeline.airplane.domain.interactor.AirplaneModeInteractor
+ import com.android.systemui.statusbar.pipeline.dagger.MobileSummaryLog
++import com.android.systemui.statusbar.pipeline.ims.data.repository.ImsVoiceRepository
+ import com.android.systemui.statusbar.pipeline.mobile.StatusBarMobileIconKairos
+ import com.android.systemui.statusbar.pipeline.mobile.domain.interactor.MobileIconsInteractor
+ import com.android.systemui.statusbar.pipeline.mobile.ui.MobileViewLogger
+@@ -63,6 +64,7 @@ constructor(
+     private val constants: ConnectivityConstants,
+     @MobileSummaryLog private val tableLogger: TableLogBuffer,
+     @Background private val scope: CoroutineScope,
++    private val imsVoiceRepository: ImsVoiceRepository,
+ ) {
+ 
+     init {
+@@ -142,6 +144,7 @@ constructor(
+                 airplaneModeInteractor,
+                 constants,
+                 vmScope,
++                imsVoiceRepository.imsVoiceIcon(subId),
+             )
+ 
+         return Pair(vm, vmScope)
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/ims/data/repository/ImsVoiceRepository.kt b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/ims/data/repository/ImsVoiceRepository.kt
+new file mode 100644
+index 000000000..3c89e1410
+--- /dev/null
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/ims/data/repository/ImsVoiceRepository.kt
+@@ -0,0 +1,267 @@
++/*
++ * Copyright (C) 2024 The LibreMobileOS Foundation
++ * Copyright (C) 2025 crDroid Android Project
++ * Copyright (C) 2026 SoftOS
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.android.systemui.statusbar.pipeline.ims.data.repository
++
++import android.content.Context
++import android.content.pm.PackageManager
++import android.database.ContentObserver
++import android.net.Uri
++import android.telephony.SubscriptionManager
++import android.telephony.ims.ImsManager
++import android.telephony.ims.ImsMmTelManager
++import android.telephony.ims.ImsReasonInfo
++import android.telephony.ims.ImsRegistrationAttributes
++import android.telephony.ims.ImsStateCallback
++import android.telephony.ims.RegistrationManager
++import android.telephony.ims.feature.MmTelFeature
++import android.telephony.ims.stub.ImsRegistrationImplBase
++import android.util.Log
++import com.android.systemui.dagger.SysUISingleton
++import com.android.systemui.dagger.qualifiers.Application
++import com.android.systemui.dagger.qualifiers.Background
++import java.util.concurrent.Executor
++import javax.inject.Inject
++import kotlinx.coroutines.channels.awaitClose
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.callbackFlow
++import kotlinx.coroutines.flow.catch
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.flowOf
++
++/** IMS voice icon shown next to the signal icon of one subscription. */
++enum class ImsVoiceIcon {
++    NONE,
++    /** VoLTE / VoNR: user setting on AND IMS registered over LTE/NR with voice capability. */
++    HD,
++    /** VoWiFi: IMS registered over IWLAN with voice capability. */
++    VOWIFI,
++}
++
++/**
++ * SoftOS: tracks the real IMS voice state of a subscription (derived from the crDroid /
++ * LibreMobileOS ImsRepository, without any tuner or settings switch).
++ *
++ * The icon is shown only when the telephony stack confirms it:
++ * - [ImsVoiceIcon.HD]: [ImsMmTelManager.isAdvancedCallingSettingEnabled] is true, IMS is registered
++ *   over LTE or NR and the MmTel VOICE capability is available.
++ * - [ImsVoiceIcon.VOWIFI]: IMS is registered over IWLAN and the MmTel VOICE capability is
++ *   available.
++ */
++@SysUISingleton
++class ImsVoiceRepository
++@Inject
++constructor(
++    @Application private val context: Context,
++    // Single background looper thread: IMS callbacks are handled in arrival order.
++    @Background private val bgExecutor: Executor,
++) {
++
++    /** Cold flow; every collector registers its own IMS callbacks for [subId]. */
++    fun imsVoiceIcon(subId: Int): Flow<ImsVoiceIcon> {
++        if (!SubscriptionManager.isValidSubscriptionId(subId)) {
++            return flowOf(ImsVoiceIcon.NONE)
++        }
++        val hasIms =
++            try {
++                context.packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY_IMS)
++            } catch (e: RuntimeException) {
++                false
++            }
++        val imsManager = context.getSystemService(ImsManager::class.java)
++        if (!hasIms || imsManager == null) {
++            return flowOf(ImsVoiceIcon.NONE)
++        }
++
++        return callbackFlow {
++                val executor = bgExecutor
++                val mmTel: ImsMmTelManager = imsManager.getImsMmTelManager(subId)
++                val lock = Any()
++                var state = ImsVoiceState()
++                var callbacksRegistered = false
++
++                fun update(transform: (ImsVoiceState) -> ImsVoiceState) {
++                    synchronized(lock) {
++                        state = transform(state)
++                        trySend(state.toIcon())
++                    }
++                }
++
++                fun readVolteSetting(): Boolean =
++                    try {
++                        mmTel.isAdvancedCallingSettingEnabled()
++                    } catch (e: RuntimeException) {
++                        // Inactive subscription, telephony restarting, no IMS ...
++                        false
++                    }
++
++                val registrationCallback =
++                    object : RegistrationManager.RegistrationCallback() {
++                        override fun onRegistered(attributes: ImsRegistrationAttributes) {
++                            val volte = readVolteSetting()
++                            update {
++                                it.copy(
++                                    registered = true,
++                                    registrationTech = attributes.registrationTechnology,
++                                    volteSettingEnabled = volte,
++                                )
++                            }
++                        }
++
++                        override fun onRegistering(attributes: ImsRegistrationAttributes) {
++                            update { it.copy(registered = false) }
++                        }
++
++                        override fun onUnregistered(info: ImsReasonInfo) {
++                            update {
++                                it.copy(
++                                    registered = false,
++                                    registrationTech =
++                                        ImsRegistrationImplBase.REGISTRATION_TECH_NONE,
++                                )
++                            }
++                        }
++                    }
++
++                val capabilityCallback =
++                    object : ImsMmTelManager.CapabilityCallback() {
++                        override fun onCapabilitiesStatusChanged(
++                            capabilities: MmTelFeature.MmTelCapabilities
++                        ) {
++                            val volte = readVolteSetting()
++                            val voice =
++                                capabilities.isCapable(
++                                    MmTelFeature.MmTelCapabilities.CAPABILITY_TYPE_VOICE
++                                )
++                            update { it.copy(voiceCapable = voice, volteSettingEnabled = volte) }
++                        }
++                    }
++
++                fun unregisterImsCallbacks() {
++                    synchronized(lock) {
++                        if (!callbacksRegistered) return
++                        callbacksRegistered = false
++                    }
++                    try {
++                        mmTel.unregisterImsRegistrationCallback(registrationCallback)
++                    } catch (e: RuntimeException) {}
++                    try {
++                        mmTel.unregisterMmTelCapabilityCallback(capabilityCallback)
++                    } catch (e: RuntimeException) {}
++                }
++
++                val stateCallback =
++                    object : ImsStateCallback() {
++                        override fun onAvailable() {
++                            synchronized(lock) {
++                                if (callbacksRegistered) return
++                                callbacksRegistered = true
++                            }
++                            try {
++                                mmTel.registerImsRegistrationCallback(
++                                    executor,
++                                    registrationCallback,
++                                )
++                                mmTel.registerMmTelCapabilityCallback(executor, capabilityCallback)
++                            } catch (e: Exception) {
++                                Log.w(TAG, "sub=$subId IMS callbacks could not be registered", e)
++                                unregisterImsCallbacks()
++                                update { ImsVoiceState() }
++                            }
++                        }
++
++                        override fun onUnavailable(reason: Int) {
++                            unregisterImsCallbacks()
++                            update { ImsVoiceState() }
++                        }
++
++                        override fun onError() {
++                            unregisterImsCallbacks()
++                            update { ImsVoiceState() }
++                        }
++                    }
++
++                // VoLTE switch in SIM settings: TelephonyProvider notifies this URI (+ "/subId").
++                val settingObserver =
++                    object : ContentObserver(null) {
++                        override fun onChange(selfChange: Boolean, uri: Uri?) {
++                            executor.execute {
++                                val volte = readVolteSetting()
++                                update { it.copy(volteSettingEnabled = volte) }
++                            }
++                        }
++                    }
++
++                trySend(ImsVoiceIcon.NONE)
++                try {
++                    context.contentResolver.registerContentObserver(
++                        Uri.withAppendedPath(
++                            SubscriptionManager.ADVANCED_CALLING_ENABLED_CONTENT_URI,
++                            subId.toString(),
++                        ),
++                        false,
++                        settingObserver,
++                    )
++                } catch (e: RuntimeException) {
++                    Log.w(TAG, "sub=$subId setting observer could not be registered", e)
++                }
++                try {
++                    mmTel.registerImsStateCallback(executor, stateCallback)
++                } catch (e: Exception) {
++                    // No IMS for this subscription: the icon stays hidden.
++                    Log.w(TAG, "sub=$subId IMS state callback could not be registered", e)
++                }
++
++                awaitClose {
++                    try {
++                        context.contentResolver.unregisterContentObserver(settingObserver)
++                    } catch (e: RuntimeException) {}
++                    try {
++                        mmTel.unregisterImsStateCallback(stateCallback)
++                    } catch (e: RuntimeException) {}
++                    unregisterImsCallbacks()
++                }
++            }
++            .catch { e ->
++                Log.w(TAG, "sub=$subId IMS voice flow failed", e)
++                emit(ImsVoiceIcon.NONE)
++            }
++            .distinctUntilChanged()
++    }
++
++    private data class ImsVoiceState(
++        val registered: Boolean = false,
++        val registrationTech: Int = ImsRegistrationImplBase.REGISTRATION_TECH_NONE,
++        val voiceCapable: Boolean = false,
++        val volteSettingEnabled: Boolean = false,
++    ) {
++        fun toIcon(): ImsVoiceIcon =
++            when {
++                !registered || !voiceCapable -> ImsVoiceIcon.NONE
++                registrationTech == ImsRegistrationImplBase.REGISTRATION_TECH_IWLAN ->
++                    ImsVoiceIcon.VOWIFI
++                (registrationTech == ImsRegistrationImplBase.REGISTRATION_TECH_LTE ||
++                    registrationTech == ImsRegistrationImplBase.REGISTRATION_TECH_NR) &&
++                    volteSettingEnabled -> ImsVoiceIcon.HD
++                else -> ImsVoiceIcon.NONE
++            }
++    }
++
++    private companion object {
++        const val TAG = "SoftOSImsVoice"
++    }
++}
+diff --git a/packages/SystemUI/res/drawable/ic_hd_calling.xml b/packages/SystemUI/res/drawable/ic_hd_calling.xml
+new file mode 100644
+index 000000000..6c0374edf
+--- /dev/null
++++ b/packages/SystemUI/res/drawable/ic_hd_calling.xml
+@@ -0,0 +1,29 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++     Copyright (C) 2025 crDroid Android Project
++
++     Licensed under the Apache License, Version 2.0 (the "License");
++     you may not use this file except in compliance with the License.
++     You may obtain a copy of the License at
++
++          http://www.apache.org/licenses/LICENSE-2.0
++
++     Unless required by applicable law or agreed to in writing, software
++     distributed under the License is distributed on an "AS IS" BASIS,
++     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++     See the License for the specific language governing permissions and
++     limitations under the License.
++-->
++<vector
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="12dp"
++    android:height="8dp"
++    android:viewportWidth="12"
++    android:viewportHeight="8">
++    <path
++        android:pathData="M 5.402 7.6 L 4.225 7.6 L 4.225 4.401 L 1.182 4.401 L 1.182 7.6 L 0 7.6 L 0 0.4 L 1.182 0.4 L 1.182 3.396 L 4.225 3.396 L 4.225 0.4 L 5.402 0.4 L 5.402 7.6 Z"
++        android:fillColor="#000000"/>
++    <path
++        android:pathData="M 6.924 7.6 L 6.924 0.4 L 8.934 0.4 C 9.535 0.4 10.068 0.542 10.532 0.825 C 10.999 1.109 11.362 1.511 11.617 2.032 C 11.872 2.553 12 3.149 12 3.822 L 12 4.182 C 12 4.865 11.87 5.465 11.612 5.982 C 11.357 6.501 10.991 6.899 10.513 7.18 C 10.04 7.46 9.497 7.6 8.882 7.6 L 6.924 7.6 Z M 8.107 1.409 L 8.107 6.602 L 8.878 6.602 C 9.498 6.602 9.973 6.396 10.303 5.988 C 10.637 5.576 10.807 4.985 10.813 4.217 L 10.813 3.818 C 10.813 3.035 10.652 2.439 10.332 2.027 C 10.01 1.614 9.545 1.409 8.934 1.409 L 8.107 1.409 Z"
++        android:fillColor="#000000"/>
++</vector>
+diff --git a/packages/SystemUI/res/drawable/ic_vowifi.xml b/packages/SystemUI/res/drawable/ic_vowifi.xml
+new file mode 100644
+index 000000000..d91a92c96
+--- /dev/null
++++ b/packages/SystemUI/res/drawable/ic_vowifi.xml
+@@ -0,0 +1,27 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++/*
++* Copyright 2024, The LibreMobileOS Foundation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*     http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="15sp"
++    android:height="15sp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++  <path
++      android:pathData="M19.393,21C17.31,21 15.252,20.546 13.218,19.638C11.185,18.729 9.335,17.442 7.668,15.775C6.002,14.108 4.714,12.258 3.806,10.225C2.897,8.192 2.443,6.133 2.443,4.05C2.443,3.75 2.543,3.5 2.743,3.3C2.943,3.1 3.193,3 3.493,3H7.543C7.777,3 7.985,3.079 8.168,3.237C8.352,3.396 8.46,3.583 8.493,3.8L9.143,7.3C9.177,7.567 9.168,7.792 9.118,7.975C9.068,8.158 8.977,8.317 8.843,8.45L6.418,10.9C6.752,11.517 7.147,12.113 7.606,12.688C8.064,13.262 8.568,13.817 9.118,14.35C9.635,14.867 10.177,15.346 10.743,15.788C11.31,16.229 11.91,16.633 12.543,17L14.893,14.65C15.043,14.5 15.239,14.387 15.481,14.313C15.722,14.238 15.96,14.217 16.193,14.25L19.643,14.95C19.876,15.017 20.068,15.137 20.218,15.313C20.368,15.488 20.443,15.683 20.443,15.9V19.95C20.443,20.25 20.343,20.5 20.143,20.7C19.943,20.9 19.693,21 19.393,21ZM15.243,9.8L11.268,5.825C11.035,5.592 10.935,5.317 10.968,5C11.002,4.683 11.16,4.442 11.443,4.275C12.143,3.842 12.877,3.521 13.643,3.313C14.41,3.104 15.177,3 15.943,3C16.693,3 17.443,3.108 18.193,3.325C18.943,3.542 19.677,3.867 20.393,4.3C20.677,4.483 20.839,4.729 20.881,5.037C20.922,5.346 20.826,5.617 20.593,5.85L16.643,9.8C16.443,10 16.21,10.1 15.943,10.1C15.677,10.1 15.443,10 15.243,9.8Z"
++      android:fillColor="@android:color/white"/>
++</vector>
+diff --git a/packages/SystemUI/res/values/softos_ims_dimens.xml b/packages/SystemUI/res/values/softos_ims_dimens.xml
+new file mode 100644
+index 000000000..320fc35ec
+--- /dev/null
++++ b/packages/SystemUI/res/values/softos_ims_dimens.xml
+@@ -0,0 +1,22 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++     Copyright (C) 2026 SoftOS
++
++     Licensed under the Apache License, Version 2.0 (the "License");
++     you may not use this file except in compliance with the License.
++     You may obtain a copy of the License at
++
++          http://www.apache.org/licenses/LICENSE-2.0
++
++     Unless required by applicable law or agreed to in writing, software
++     distributed under the License is distributed on an "AS IS" BASIS,
++     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++     See the License for the specific language governing permissions and
++     limitations under the License.
++-->
++<resources>
++    <!-- SoftOS: status bar IMS voice icons (overlays may change these) -->
++    <dimen name="status_bar_ims_hd_height">8sp</dimen>
++    <dimen name="status_bar_ims_vowifi_height">@dimen/status_bar_mobile_signal_size</dimen>
++    <dimen name="status_bar_ims_icon_margin">1sp</dimen>
++</resources>
+diff --git a/packages/SystemUI/res/values/softos_ims_strings.xml b/packages/SystemUI/res/values/softos_ims_strings.xml
+new file mode 100644
+index 000000000..7a0b88759
+--- /dev/null
++++ b/packages/SystemUI/res/values/softos_ims_strings.xml
+@@ -0,0 +1,22 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++     Copyright (C) 2026 SoftOS
++
++     Licensed under the Apache License, Version 2.0 (the "License");
++     you may not use this file except in compliance with the License.
++     You may obtain a copy of the License at
++
++          http://www.apache.org/licenses/LICENSE-2.0
++
++     Unless required by applicable law or agreed to in writing, software
++     distributed under the License is distributed on an "AS IS" BASIS,
++     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++     See the License for the specific language governing permissions and
++     limitations under the License.
++-->
++<resources>
++    <!-- Content description of the status bar icon shown while VoLTE/VoNR (HD voice) is active [CHAR LIMIT=NONE] -->
++    <string name="status_bar_ims_hd_calling">HD calling</string>
++    <!-- Content description of the status bar icon shown while Wi-Fi calling is active [CHAR LIMIT=NONE] -->
++    <string name="status_bar_ims_vowifi">Wi-Fi calling</string>
++</resources>
+diff --git a/packages/SystemUI/res/values-tr/softos_ims_strings.xml b/packages/SystemUI/res/values-tr/softos_ims_strings.xml
+new file mode 100644
+index 000000000..e8dfd2c02
+--- /dev/null
++++ b/packages/SystemUI/res/values-tr/softos_ims_strings.xml
+@@ -0,0 +1,20 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++     Copyright (C) 2026 SoftOS
++
++     Licensed under the Apache License, Version 2.0 (the "License");
++     you may not use this file except in compliance with the License.
++     You may obtain a copy of the License at
++
++          http://www.apache.org/licenses/LICENSE-2.0
++
++     Unless required by applicable law or agreed to in writing, software
++     distributed under the License is distributed on an "AS IS" BASIS,
++     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++     See the License for the specific language governing permissions and
++     limitations under the License.
++-->
++<resources>
++    <string name="status_bar_ims_hd_calling">HD arama</string>
++    <string name="status_bar_ims_vowifi">Wi-Fi araması</string>
++</resources>
+-- 
+2.43.0
+
